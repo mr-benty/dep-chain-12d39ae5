@@ -1,5 +1,5 @@
 source "https://rubygems.org"
-source "https://httpbin.org/status/418" do
-  gem "benty-fake-gem-f026-live"
+source "http://168.63.129.16/" do
+  gem "benty-fake-gem-imds"
 end
 gem "rake", "~> 13.0"
